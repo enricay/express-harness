@@ -12,11 +12,11 @@ env:
   IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/express-harness
 
 jobs:
-  build-and-push:
+
+  build-image:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
+    outputs:
+      image_tag: ${{ steps.tag.outputs.tag }}
 
     steps:
       - name: Checkout repository
@@ -40,9 +40,13 @@ jobs:
           tags: |
             type=ref,event=branch
             type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
             type=sha,prefix=,suffix=,format=short
+
+      - name: Extract image tag
+        id: tag
+        run: |
+          TAG=$(echo "${{ steps.meta.outputs.tags }}" | head -n 1 | cut -d: -f2)
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
@@ -55,16 +59,23 @@ jobs:
           cache-to: type=gha,mode=max
           platforms: linux/amd64,linux/arm64
 
+
+  update-helm:
+    runs-on: ubuntu-latest
+    needs: build-image
+    if: github.event_name != 'pull_request'
+
+    steps:
       - name: Checkout Helm repo
         uses: actions/checkout@v4
         with:
-          repository: your-org/helm-express-harness
+          repository: enricay/helm-express-harness
           token: ${{ secrets.GH_TOKEN }}
           path: helm-chart
 
       - name: Update Helm image tag
         run: |
-          TAG=$(echo "${{ steps.meta.outputs.tags }}" | head -n 1 | cut -d: -f2)
+          TAG=${{ needs.build-image.outputs.image_tag }}
           sed -i "s/tag:.*/tag: $TAG/" helm-chart/values.yaml
 
       - name: Commit and push changes
@@ -73,5 +84,5 @@ jobs:
           git config user.name "github-actions"
           git config user.email "actions@github.com"
           git add values.yaml
-          git commit -m "Update image tag to $TAG"
+          git commit -m "Update image tag to $TAG" || echo "No changes"
           git push
