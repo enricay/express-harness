@@ -54,3 +54,24 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           platforms: linux/amd64,linux/arm64
+
+      - name: Checkout Helm repo
+        uses: actions/checkout@v4
+        with:
+          repository: your-org/helm-express-harness
+          token: ${{ secrets.GH_TOKEN }}
+          path: helm-chart
+
+      - name: Update Helm image tag
+        run: |
+          TAG=$(echo "${{ steps.meta.outputs.tags }}" | head -n 1 | cut -d: -f2)
+          sed -i "s/tag:.*/tag: $TAG/" helm-chart/values.yaml
+
+      - name: Commit and push changes
+        run: |
+          cd helm-chart
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add values.yaml
+          git commit -m "Update image tag to $TAG"
+          git push
