@@ -1,77 +1,331 @@
-name: Docker Build and Push
+name: Production Grade Pipeline
 
 on:
   push:
-    branches: [ "master" ]
+    branches: ["master"]
   pull_request:
-    branches: [ "master" ]
+    branches: ["master"]
 
 env:
   REGISTRY: docker.io
   IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/express-harness
+  HARNESS_ACCOUNT_ID: ${{ secrets.HARNESS_ACCOUNT_ID }}
+  HARNESS_ORG_ID: ${{ secrets.HARNESS_ORG_ID }}
+  HARNESS_PROJECT_ID: ${{ secrets.HARNESS_PROJECT_ID }}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
 
-  build-image:
+# -----------------------------
+# BUILD & PUSH IMAGE
+# -----------------------------
+  build:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 20
     outputs:
-      image_tag: ${{ steps.tag.outputs.tag }}
+      image_tag: ${{ steps.meta.outputs.tag }}
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
+      - name: Notify Harness - Pipeline Started
+        run: |
+          COMMIT_MSG=$(echo "${{ github.event.head_commit.message }}" | tr -d '\n"' | head -c 100)
+          curl -s -X POST https://app.harness.io/gateway/pipeline/api/ci/visibility/build \
+            -H "x-api-key: ${{ secrets.HARNESS_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "accountIdentifier": "'"$HARNESS_ACCOUNT_ID"'",
+              "orgIdentifier": "'"$HARNESS_ORG_ID"'",
+              "projectIdentifier": "'"$HARNESS_PROJECT_ID"'",
+              "pipelineName": "express-harness",
+              "buildId": "'"${{ github.run_id }}"'",
+              "status": "STARTED",
+              "repo": "'"${{ github.repository }}"'",
+              "branch": "'"${{ github.ref_name }}"'",
+              "commitSha": "'"${{ github.sha }}"'",
+              "author": "'"${{ github.actor }}"'",
+              "commitMessage": "'"$COMMIT_MSG"'",
+              "eventType": "'"${{ github.event_name }}"'"
+            }' || true
+
+      - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Extract commit tag
-        id: tag
+      - name: Generate Image Tag
+        id: meta
         run: |
           TAG=${GITHUB_SHA::7}
           echo "tag=$TAG" >> $GITHUB_OUTPUT
 
-      - name: Log in to Docker Hub
+      - name: Login to DockerHub
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push Docker image
+      - name: Build and Push Multi-Arch Image
         uses: docker/build-push-action@v5
         with:
           context: .
           push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
+          platforms: linux/amd64,linux/arm64
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          platforms: linux/amd64,linux/arm64
 
-
-  update-helm:
+# -----------------------------
+# HELM UPDATE
+# -----------------------------
+  deploy:
+    needs: build
     runs-on: ubuntu-latest
-    needs: build-image
+    timeout-minutes: 20
     if: github.event_name != 'pull_request'
 
+    outputs:
+      deploy_status: ${{ steps.argocd.outputs.deploy_status }}
+      health_status: ${{ steps.argocd.outputs.health_status }}
+
     steps:
-      - name: Checkout Helm repo
+      - name: Checkout Helm Repo
         uses: actions/checkout@v4
         with:
           repository: enricay/helm-express-harness
           token: ${{ secrets.GH_TOKEN }}
-          path: helm-chart
+          path: helm
+          fetch-depth: 0
 
-      - name: Update Helm image tag
+      - name: Install yq
         run: |
-          TAG=${{ needs.build-image.outputs.image_tag }}
-          sed -i "s/tag:.*/tag: $TAG/" helm-chart/values.yaml
+          sudo wget -qO /usr/local/bin/yq \
+            https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
 
-      - name: Commit and push changes
+      - name: Update Image Tag
         run: |
-          cd helm-chart
+          yq e '.image.tag = "${{ needs.build.outputs.image_tag }}"' -i helm/values.yaml
+
+      - name: Commit Helm Change
+        run: |
+          cd helm
           git config user.name "github-actions"
           git config user.email "actions@github.com"
           git add values.yaml
-          git commit -m "Update image tag to $TAG" || echo "No changes"
+          git commit -m "Deploy image ${{ needs.build.outputs.image_tag }}" || echo "No change"
           git push
+
+# -----------------------------
+# ARGOCD SYNC
+# -----------------------------
+      - name: Install ArgoCD CLI
+        run: |
+          curl -sSL -o /usr/local/bin/argocd \
+            https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          chmod +x /usr/local/bin/argocd
+
+      - name: ArgoCD Sync Application
+        id: argocd
+        run: |
+          argocd login ${{ secrets.ARGOCD_SERVER }} \
+            --username ${{ secrets.ARGOCD_USERNAME }} \
+            --password ${{ secrets.ARGOCD_PASSWORD }} \
+            --grpc-web \
+            --insecure
+
+          # Capture AFTER login, BEFORE sync — reflects actual deployment start time
+          DEPLOY_STARTED=$(date -u +%s%3N)
+          echo "deploy_started_at=$DEPLOY_STARTED" >> $GITHUB_OUTPUT
+
+          argocd app sync ${{ secrets.TARGET_APP }} \
+            --grpc-web \
+            --insecure
+
+          if argocd app wait ${{ secrets.TARGET_APP }} \
+            --health \
+            --timeout 300 \
+            --grpc-web \
+            --insecure; then
+            echo "deploy_status=SUCCESS" >> $GITHUB_OUTPUT
+            echo "health_status=HEALTHY" >> $GITHUB_OUTPUT
+          else
+            echo "deploy_status=FAILED" >> $GITHUB_OUTPUT
+            echo "health_status=DEGRADED" >> $GITHUB_OUTPUT
+          fi
+
+          DEPLOY_ENDED=$(date -u +%s%3N)
+          echo "deploy_ended_at=$DEPLOY_ENDED" >> $GITHUB_OUTPUT
+
+# -----------------------------
+# DORA - DEPLOYMENT FREQUENCY + LEAD TIME
+# Uses: /gateway/ng/api/events/deployment
+# -----------------------------
+      - name: Report Deployment to Harness (DORA - Deployment Frequency + Lead Time)
+        run: |
+          [[ "${{ steps.argocd.outputs.deploy_status }}" == "SUCCESS" ]] \
+            && HARNESS_STATUS="Success" || HARNESS_STATUS="Failed"
+
+          curl -s -X POST \
+            "https://app.harness.io/gateway/ng/api/events/deployment?accountIdentifier=${HARNESS_ACCOUNT_ID}&orgIdentifier=${HARNESS_ORG_ID}&projectIdentifier=${HARNESS_PROJECT_ID}" \
+            -H "x-api-key: ${{ secrets.HARNESS_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "pipelineExecutionId": "'"${{ github.run_id }}"'",
+              "pipelineName": "express-harness",
+              "serviceId": "express-harness",
+              "environmentId": "production",
+              "status": "'"$HARNESS_STATUS"'",
+              "startedAt": '"${{ steps.argocd.outputs.deploy_started_at }}"',
+              "endedAt":   '"${{ steps.argocd.outputs.deploy_ended_at }}"',
+              "artifact": {
+                "artifactTag": "'"${{ needs.build.outputs.image_tag }}"'",
+                "displayName": "express-harness:'"${{ needs.build.outputs.image_tag }}"'"
+              },
+              "triggeredBy": { "name": "'"${{ github.actor }}"'" },
+              "commitSha": "'"${{ github.sha }}"'",
+              "repo": "'"${{ github.repository }}"'",
+              "branch": "'"${{ github.ref_name }}"'"
+            }' || true
+
+# -----------------------------
+# ROLLBACK + DORA - CHANGE FAILURE RATE + MTTR
+# Uses: /gateway/cv/api/change-event/register
+# -----------------------------
+      - name: Rollback on Failure + Report Incident to Harness (DORA - CFR + MTTR)
+        if: steps.argocd.outputs.health_status == 'DEGRADED'
+        run: |
+          INCIDENT_START=$(date -u +%s%3N)
+          echo "Deploy degraded at: $INCIDENT_START ms"
+
+          # --- Report incident OPEN (contributes to Change Failure Rate) ---
+          curl -s -X POST \
+            "https://app.harness.io/gateway/cv/api/change-event/register?accountIdentifier=${HARNESS_ACCOUNT_ID}&orgIdentifier=${HARNESS_ORG_ID}&projectIdentifier=${HARNESS_PROJECT_ID}" \
+            -H "x-api-key: ${{ secrets.HARNESS_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "name": "Deploy failure - express-harness:'"${{ needs.build.outputs.image_tag }}"'",
+              "eventTime": '"$INCIDENT_START"',
+              "type": "INCIDENT",
+              "serviceIdentifier": "express-harness",
+              "envIdentifier": "production",
+              "changeSourceIdentifier": "github-actions",
+              "metadata": {
+                "type": "CUSTOM_INCIDENT",
+                "status": "Open",
+                "pipelineExecutionId": "'"${{ github.run_id }}"'",
+                "commitSha": "'"${{ github.sha }}"'",
+                "artifactTag": "'"${{ needs.build.outputs.image_tag }}"'"
+              }
+            }' || true
+
+          # --- Rollback to last healthy ArgoCD revision ---
+          echo "Initiating ArgoCD rollback..."
+          argocd app rollback ${{ secrets.TARGET_APP }} --grpc-web --insecure
+
+          RESTORE_STATUS="Open"
+          if argocd app wait ${{ secrets.TARGET_APP }} \
+            --health \
+            --timeout 300 \
+            --grpc-web \
+            --insecure; then
+            echo "Rollback succeeded — application restored."
+            RESTORE_STATUS="Resolved"
+          else
+            echo "WARNING: Rollback failed — manual intervention required."
+          fi
+
+          INCIDENT_END=$(date -u +%s%3N)
+          MTTR_SECONDS=$(( ($INCIDENT_END - $INCIDENT_START) / 1000 ))
+          echo "MTTR: ${MTTR_SECONDS}s (rollback duration)"
+
+          # --- Report incident RESOLVED (contributes to MTTR) ---
+          curl -s -X POST \
+            "https://app.harness.io/gateway/cv/api/change-event/register?accountIdentifier=${HARNESS_ACCOUNT_ID}&orgIdentifier=${HARNESS_ORG_ID}&projectIdentifier=${HARNESS_PROJECT_ID}" \
+            -H "x-api-key: ${{ secrets.HARNESS_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "name": "Rollback '"$RESTORE_STATUS"' - express-harness:'"${{ needs.build.outputs.image_tag }}"'",
+              "eventTime": '"$INCIDENT_END"',
+              "type": "INCIDENT",
+              "serviceIdentifier": "express-harness",
+              "envIdentifier": "production",
+              "changeSourceIdentifier": "github-actions",
+              "metadata": {
+                "type": "CUSTOM_INCIDENT",
+                "status": "'"$RESTORE_STATUS"'",
+                "pipelineExecutionId": "'"${{ github.run_id }}"'",
+                "commitSha": "'"${{ github.sha }}"'",
+                "artifactTag": "'"${{ needs.build.outputs.image_tag }}"'",
+                "mttrSeconds": '"$MTTR_SECONDS"'
+              }
+            }' || true
+
+# -----------------------------
+# NOTIFICATIONS + FINAL STATUS
+# -----------------------------
+  notify:
+    needs: [build, deploy]
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: Determine Pipeline Status
+        id: status
+        run: |
+          if [[ "${{ needs.build.result }}" == "success" && \
+               ( "${{ needs.deploy.result }}" == "success" || "${{ needs.deploy.result }}" == "skipped" ) ]]; then
+            echo "status=SUCCESS" >> $GITHUB_OUTPUT
+            echo "color=00C853" >> $GITHUB_OUTPUT
+          else
+            echo "status=FAILED" >> $GITHUB_OUTPUT
+            echo "color=D32F2F" >> $GITHUB_OUTPUT
+          fi
+
+      # - name: Notify Teams
+      #   run: |
+      #     curl -H "Content-Type: application/json" \
+      #       -d '{
+      #         "@type": "MessageCard",
+      #         "@context": "http://schema.org/extensions",
+      #         "summary": "Deployment",
+      #         "themeColor": "${{ steps.status.outputs.color }}",
+      #         "title": "Express Harness Deployment",
+      #         "sections": [{
+      #           "facts": [
+      #             {"name": "Repository",    "value": "${{ github.repository }}"},
+      #             {"name": "Branch",        "value": "${{ github.ref_name }}"},
+      #             {"name": "Status",        "value": "${{ steps.status.outputs.status }}"},
+      #             {"name": "Image",         "value": "${{ needs.build.outputs.image_tag }}"},
+      #             {"name": "Commit",        "value": "${{ github.sha }}"},
+      #             {"name": "Triggered By",  "value": "${{ github.actor }}"},
+      #             {"name": "ArgoCD Health", "value": "${{ needs.deploy.outputs.health_status }}"}
+      #           ]
+      #         }]
+      #       }' \
+      #       ${{ secrets.TEAMS_WEBHOOK }}
+
+      - name: Notify Harness Final Status
+        run: |
+          curl -s -X POST https://app.harness.io/gateway/pipeline/api/ci/visibility/build \
+            -H "x-api-key: ${{ secrets.HARNESS_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "accountIdentifier": "'"$HARNESS_ACCOUNT_ID"'",
+              "orgIdentifier": "'"$HARNESS_ORG_ID"'",
+              "projectIdentifier": "'"$HARNESS_PROJECT_ID"'",
+              "pipelineName": "express-harness",
+              "buildId": "'"${{ github.run_id }}"'",
+              "status": "'"${{ steps.status.outputs.status }}"'",
+              "repo": "'"${{ github.repository }}"'",
+              "branch": "'"${{ github.ref_name }}"'",
+              "commitSha": "'"${{ github.sha }}"'",
+              "author": "'"${{ github.actor }}"'",
+              "service": "express-harness",
+              "environment": "production",
+              "eventType": "'"${{ github.event_name }}"'"
+            }' || true
