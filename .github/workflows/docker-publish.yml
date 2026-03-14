@@ -35,7 +35,8 @@ jobs:
       - name: Notify Harness - Pipeline Started
         run: |
           COMMIT_MSG=$(echo "${{ github.event.head_commit.message }}" | tr -d '\n"' | head -c 100)
-          curl -s -X POST https://app.harness.io/gateway/pipeline/api/ci/visibility/build \
+          HTTP_CODE=$(curl -s -w "%{http_code}" -o /tmp/harness_started.json -X POST \
+            https://app.harness.io/gateway/pipeline/api/ci/visibility/build \
             -H "x-api-key: ${{ secrets.HARNESS_API_KEY }}" \
             -H "Content-Type: application/json" \
             -d '{
@@ -51,7 +52,8 @@ jobs:
               "author": "'"${{ github.actor }}"'",
               "commitMessage": "'"$COMMIT_MSG"'",
               "eventType": "'"${{ github.event_name }}"'"
-            }' || true
+            }') || true
+          echo "Harness pipeline started → HTTP $HTTP_CODE: $(cat /tmp/harness_started.json)"
 
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -170,7 +172,7 @@ jobs:
           [[ "${{ steps.argocd.outputs.deploy_status }}" == "SUCCESS" ]] \
             && HARNESS_STATUS="Success" || HARNESS_STATUS="Failed"
 
-          curl -s -X POST \
+          HTTP_CODE=$(curl -s -w "%{http_code}" -o /tmp/harness_deploy.json -X POST \
             "https://app.harness.io/gateway/ng/api/events/deployment?accountIdentifier=${HARNESS_ACCOUNT_ID}&orgIdentifier=${HARNESS_ORG_ID}&projectIdentifier=${HARNESS_PROJECT_ID}" \
             -H "x-api-key: ${{ secrets.HARNESS_API_KEY }}" \
             -H "Content-Type: application/json" \
@@ -190,7 +192,8 @@ jobs:
               "commitSha": "'"${{ github.sha }}"'",
               "repo": "'"${{ github.repository }}"'",
               "branch": "'"${{ github.ref_name }}"'"
-            }' || true
+            }') || true
+          echo "Harness DORA deployment → HTTP $HTTP_CODE: $(cat /tmp/harness_deploy.json)"
 
 # -----------------------------
 # ROLLBACK + DORA - CHANGE FAILURE RATE + MTTR
@@ -311,7 +314,8 @@ jobs:
 
       - name: Notify Harness Final Status
         run: |
-          curl -s -X POST https://app.harness.io/gateway/pipeline/api/ci/visibility/build \
+          HTTP_CODE=$(curl -s -w "%{http_code}" -o /tmp/harness_final.json -X POST \
+            https://app.harness.io/gateway/pipeline/api/ci/visibility/build \
             -H "x-api-key: ${{ secrets.HARNESS_API_KEY }}" \
             -H "Content-Type: application/json" \
             -d '{
@@ -328,4 +332,5 @@ jobs:
               "service": "express-harness",
               "environment": "production",
               "eventType": "'"${{ github.event_name }}"'"
-            }' || true
+            }') || true
+          echo "Harness final status → HTTP $HTTP_CODE: $(cat /tmp/harness_final.json)"
